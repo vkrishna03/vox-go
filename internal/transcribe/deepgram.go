@@ -17,8 +17,8 @@ type Deepgram struct {
 	apiKey string
 }
 
-// DeepgramResult is the transcription response from Deepgram.
-type DeepgramResult struct {
+// deepgramResult is the raw JSON response from Deepgram.
+type deepgramResult struct {
 	Type    string `json:"type"`
 	IsFinal bool   `json:"is_final"`
 	Channel struct {
@@ -33,7 +33,6 @@ func NewDeepgram(apiKey string) *Deepgram {
 	return &Deepgram{apiKey: apiKey}
 }
 
-// Connect establishes a WebSocket connection with streaming params.
 func (d *Deepgram) Connect(ctx context.Context) error {
 	url := deepgramURL + "?model=nova-3&encoding=linear16&sample_rate=16000&interim_results=true&punctuate=true"
 
@@ -52,37 +51,41 @@ func (d *Deepgram) Connect(ctx context.Context) error {
 	return nil
 }
 
-// SendAudio sends raw PCM audio bytes as a binary WebSocket frame.
 func (d *Deepgram) SendAudio(data []byte) error {
 	return d.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
-// Receive reads the next transcription result from Deepgram.
-func (d *Deepgram) Receive() (*DeepgramResult, error) {
+func (d *Deepgram) Receive() (*Result, error) {
 	_, msg, err := d.conn.ReadMessage()
 	if err != nil {
 		return nil, fmt.Errorf("deepgram read: %w", err)
 	}
 
-	var result DeepgramResult
-	if err := json.Unmarshal(msg, &result); err != nil {
+	var raw deepgramResult
+	if err := json.Unmarshal(msg, &raw); err != nil {
 		return nil, fmt.Errorf("deepgram unmarshal: %w", err)
 	}
-	return &result, nil
+
+	// Skip non-result messages
+	if raw.Type != "Results" || len(raw.Channel.Alternatives) == 0 {
+		return &Result{}, nil
+	}
+
+	return &Result{
+		Text:    raw.Channel.Alternatives[0].Transcript,
+		IsFinal: raw.IsFinal,
+	}, nil
 }
 
-// KeepAlive sends a keep-alive message to prevent timeout.
 func (d *Deepgram) KeepAlive() error {
 	msg := []byte(`{"type":"KeepAlive"}`)
 	return d.conn.WriteMessage(websocket.TextMessage, msg)
 }
 
-// Close gracefully closes the Deepgram connection.
 func (d *Deepgram) Close() error {
 	if d.conn == nil {
 		return nil
 	}
-	// Send close message
 	d.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Close"}`))
 	return d.conn.Close()
 }

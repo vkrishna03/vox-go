@@ -10,6 +10,8 @@ import (
 
 	"github.com/vkrishna03/vox-go/internal/audio"
 	"github.com/vkrishna03/vox-go/internal/config"
+	"github.com/vkrishna03/vox-go/internal/conversation"
+	"github.com/vkrishna03/vox-go/internal/llm"
 	"github.com/vkrishna03/vox-go/internal/transcribe"
 	"github.com/vkrishna03/vox-go/internal/vad"
 )
@@ -37,7 +39,7 @@ func run() error {
 	defer vad.Shutdown()
 
 	// Init VAD
-	detector, err := vad.NewDetector("models/silero_vad.onnx", 0.5)
+	detector, err := vad.NewDetector("models/silero_vad.onnx", cfg.VADThreshold)
 	if err != nil {
 		return fmt.Errorf("vad: %w", err)
 	}
@@ -50,12 +52,19 @@ func run() error {
 	}
 	defer rec.Close()
 
-	// Connect to Deepgram
-	dg := transcribe.NewDeepgram(cfg.DeepgramAPIKey)
-	if err := dg.Connect(ctx); err != nil {
+	// Connect to STT provider
+	stt, err := newTranscriber(cfg)
+	if err != nil {
 		return err
 	}
-	defer dg.Close()
+	if err := stt.Connect(ctx); err != nil {
+		return err
+	}
+	defer stt.Close()
+
+	// Init LLM client and conversation
+	llmClient := llm.NewOpenAIClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	conv := conversation.New(llmClient)
 
 	fmt.Println("Listening... (Ctrl+C to stop)")
 	fmt.Println()
@@ -66,16 +75,19 @@ func run() error {
 
 	var wg sync.WaitGroup
 
-	// Goroutine: mic → VAD → deepgram
+	// Goroutine 1: mic → VAD → STT + speechCh signaling
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 
 		speaking := false
 		silenceFrames := 0
-		// Number of silent frames before we consider speech ended.
-		// 30 frames * 32ms = ~960ms of silence to end a phrase.
-		const silenceThreshold = 30
+		const silenceThreshold = 30 // ~960ms
+
+		// Pre-roll buffer: keep last 10 frames (~320ms) so we don't clip
+		// the start of words when VAD triggers.
+		const prerollSize = 10
+		preroll := make([][]int16, 0, prerollSize)
 
 		for {
 			select {
@@ -99,26 +111,46 @@ func run() error {
 
 			if isSpeech {
 				silenceFrames = 0
-				speaking = true
-				bytes := audio.Int16ToBytes(samples)
-				if err := dg.SendAudio(bytes); err != nil {
+				if !speaking {
+					speaking = true
+					// Signal: speech started
+					select {
+					case conv.SpeechCh <- true:
+					default:
+					}
+					// Flush pre-roll buffer so Deepgram gets the start of the word
+					for _, old := range preroll {
+						stt.SendAudio(audio.Int16ToBytes(old))
+					}
+					preroll = preroll[:0]
+				}
+				if err := stt.SendAudio(audio.Int16ToBytes(samples)); err != nil {
 					fmt.Fprintf(os.Stderr, "send error: %v\n", err)
 					return
 				}
 			} else if speaking {
 				silenceFrames++
-				// Keep sending during short pauses to avoid chopping phrases
-				bytes := audio.Int16ToBytes(samples)
-				dg.SendAudio(bytes)
+				stt.SendAudio(audio.Int16ToBytes(samples))
 
 				if silenceFrames >= silenceThreshold {
 					speaking = false
+					// Signal: speech ended
+					select {
+					case conv.SpeechCh <- false:
+					default:
+					}
 				}
+			} else {
+				// Not speaking — fill pre-roll buffer (ring buffer)
+				if len(preroll) >= prerollSize {
+					preroll = preroll[1:]
+				}
+				preroll = append(preroll, samples)
 			}
 		}
 	}()
 
-	// Goroutine: deepgram → terminal
+	// Goroutine 2: transcriber → transcriptCh
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -129,7 +161,7 @@ func run() error {
 			default:
 			}
 
-			result, err := dg.Receive()
+			result, err := stt.Receive()
 			if err != nil {
 				select {
 				case <-ctx.Done():
@@ -140,27 +172,24 @@ func run() error {
 				}
 			}
 
-			if result.Type != "Results" {
-				continue
-			}
-			if len(result.Channel.Alternatives) == 0 {
-				continue
-			}
-
-			text := result.Channel.Alternatives[0].Transcript
-			if text == "" {
+			if result.Text == "" {
 				continue
 			}
 
 			if result.IsFinal {
-				fmt.Printf("\r\033[K> %s\n", text)
-			} else {
-				fmt.Printf("\r\033[K  %s", text)
+				conv.TranscriptCh <- result.Text
 			}
 		}
 	}()
 
-	// Goroutine: keep-alive every 5s
+	// Goroutine 3: conversation state machine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conv.Run(ctx)
+	}()
+
+	// Goroutine 4: deepgram keep-alive
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -171,7 +200,7 @@ func run() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				dg.KeepAlive()
+				stt.KeepAlive()
 			}
 		}
 	}()
@@ -180,4 +209,13 @@ func run() error {
 	fmt.Println("\nStopping...")
 	wg.Wait()
 	return nil
+}
+
+func newTranscriber(cfg *config.Config) (transcribe.Transcriber, error) {
+	switch cfg.STTProvider {
+	case "deepgram":
+		return transcribe.NewDeepgram(cfg.STTAPIKey), nil
+	default:
+		return nil, fmt.Errorf("unknown STT provider: %s", cfg.STTProvider)
+	}
 }
