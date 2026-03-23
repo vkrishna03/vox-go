@@ -13,6 +13,7 @@ import (
 	"github.com/vkrishna03/vox-go/internal/conversation"
 	"github.com/vkrishna03/vox-go/internal/llm"
 	"github.com/vkrishna03/vox-go/internal/logging"
+	"github.com/vkrishna03/vox-go/internal/pipeline"
 	"github.com/vkrishna03/vox-go/internal/transcribe"
 	"github.com/vkrishna03/vox-go/internal/tts"
 	"github.com/vkrishna03/vox-go/internal/tui"
@@ -37,7 +38,7 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Init ONNX Runtime
+	// Init components
 	if err := vad.Init("/opt/homebrew/lib/libonnxruntime.dylib"); err != nil {
 		return fmt.Errorf("onnx init: %w", err)
 	}
@@ -82,8 +83,10 @@ func run() error {
 	// Shared update channel for TUI
 	updateCh := make(chan any, 64)
 
+	// Wire everything together
 	llmClient := llm.NewOpenAIClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
-	conv := conversation.New(llmClient, synth, player, updateCh)
+	conv := conversation.New(llmClient, synth, player, updateCh, cfg.DrainDelay)
+	pipe := pipeline.New(rec, detector, stt, conv, cfg, updateCh)
 
 	if err := rec.Start(); err != nil {
 		return fmt.Errorf("start recording: %w", err)
@@ -91,91 +94,11 @@ func run() error {
 
 	var wg sync.WaitGroup
 
-	// Goroutine 1: mic → VAD → STT + speechCh + audio levels
+	// Goroutine 1: mic → VAD → STT
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	go func() { defer wg.Done(); pipe.Run(ctx) }()
 
-		speaking := false
-		silenceFrames := 0
-		const silenceThreshold = 30
-
-		const prerollSize = 10
-		preroll := make([][]int16, 0, prerollSize)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			samples, err := rec.Read()
-			if err != nil {
-				logging.Logger.Error("mic read", "err", err)
-				return
-			}
-
-			// Send audio levels to TUI
-			floats := audio.Int16ToFloat32(samples)
-			prob, err := detector.Detect(floats)
-			if err != nil {
-				logging.Logger.Error("vad", "err", err)
-				return
-			}
-
-			// During TTS, raise threshold for interruption
-			threshold := cfg.VADThreshold
-			if conv.Speaking {
-				threshold = cfg.VADThresholdBump
-			}
-			isSpeech := prob >= threshold
-
-			// Send audio levels + current threshold to TUI
-			level := tui.RMS(samples)
-			select {
-			case updateCh <- tui.AudioMsg{Level: level, VADProb: prob, Threshold: threshold}:
-			default:
-			}
-
-			if isSpeech {
-				silenceFrames = 0
-				if !speaking {
-					speaking = true
-					select {
-					case conv.SpeechCh <- true:
-					default:
-					}
-					for _, old := range preroll {
-						stt.SendAudio(audio.Int16ToBytes(old))
-					}
-					preroll = preroll[:0]
-				}
-				if err := stt.SendAudio(audio.Int16ToBytes(samples)); err != nil {
-					logging.Logger.Error("stt send", "err", err)
-					return
-				}
-			} else if speaking {
-				silenceFrames++
-				stt.SendAudio(audio.Int16ToBytes(samples))
-
-				if silenceFrames >= silenceThreshold {
-					speaking = false
-					select {
-					case conv.SpeechCh <- false:
-					default:
-					}
-				}
-			} else {
-				if len(preroll) >= prerollSize {
-					preroll = preroll[1:]
-				}
-				preroll = append(preroll, samples)
-			}
-		}
-	}()
-
-	// Goroutine 2: transcriber → transcriptCh
+	// Goroutine 2: STT → transcriptCh
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -185,7 +108,6 @@ func run() error {
 				return
 			default:
 			}
-
 			result, err := stt.Receive()
 			if err != nil {
 				select {
@@ -196,12 +118,7 @@ func run() error {
 					return
 				}
 			}
-
-			if result.Text == "" {
-				continue
-			}
-
-			if result.IsFinal {
+			if result.Text != "" && result.IsFinal {
 				conv.TranscriptCh <- result.Text
 			}
 		}
@@ -209,10 +126,7 @@ func run() error {
 
 	// Goroutine 3: conversation state machine
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		conv.Run(ctx)
-	}()
+	go func() { defer wg.Done(); conv.Run(ctx) }()
 
 	// Goroutine 4: STT keep-alive
 	wg.Add(1)

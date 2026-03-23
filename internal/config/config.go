@@ -4,24 +4,28 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	Addr         string
-	STTProvider  string
-	STTAPIKey    string
-	STTModel     string
-	TTSProvider  string
-	TTSAPIKey    string
-	TTSModel     string
-	LLMBaseURL   string
-	LLMAPIKey    string
-	LLMModel     string
-	VADThreshold      float32
-	VADThresholdBump  float32
-	LogLevel          string
+	Addr             string
+	STTProvider      string
+	STTAPIKey        string
+	STTModel         string
+	TTSProvider      string
+	TTSAPIKey        string
+	TTSModel         string
+	LLMBaseURL       string
+	LLMAPIKey        string
+	LLMModel         string
+	VADThreshold     float32
+	VADThresholdBump float32
+	SilenceFrames    int
+	PrerollSize      int
+	DrainDelay       time.Duration
+	LogLevel         string
 }
 
 func Load() (*Config, error) {
@@ -51,7 +55,7 @@ func Load() (*Config, error) {
 
 	ttsKey := os.Getenv("TTS_API_KEY")
 	if ttsKey == "" {
-		ttsKey = sttKey // default: reuse STT key (same Deepgram account)
+		ttsKey = sttKey
 	}
 
 	ttsModel := os.Getenv("TTS_MODEL")
@@ -74,35 +78,48 @@ func Load() (*Config, error) {
 		llmModel = "llama-3.3-70b-versatile"
 	}
 
-	var vadThreshold float32 = 0.3
-	if v := os.Getenv("VAD_THRESHOLD"); v != "" {
-		if f, err := strconv.ParseFloat(v, 32); err == nil {
-			vadThreshold = float32(f)
-		}
-	}
+	vadThreshold := envFloat32("VAD_THRESHOLD", 0.3)
+	vadThresholdBump := envFloat32("VAD_THRESHOLD_BUMP", 0.7)
+	silenceFrames := envInt("SILENCE_FRAMES", 30)
+	prerollSize := envInt("PREROLL_SIZE", 10)
+	drainDelay := time.Duration(envInt("DRAIN_DELAY_MS", 500)) * time.Millisecond
 
-	var vadThresholdBump float32 = 0.7
-	if v := os.Getenv("VAD_THRESHOLD_BUMP"); v != "" {
-		if f, err := strconv.ParseFloat(v, 32); err == nil {
-			vadThresholdBump = float32(f)
-		}
-	}
-
-	logLevel := os.Getenv("LOG_LEVEL") // empty = disabled, "debug", "info", "warn", "error"
+	logLevel := os.Getenv("LOG_LEVEL")
 
 	return &Config{
-		Addr:         ":8080",
-		STTProvider:  sttProvider,
-		STTAPIKey:    sttKey,
-		STTModel:     sttModel,
-		TTSProvider:  ttsProvider,
-		TTSAPIKey:    ttsKey,
-		TTSModel:     ttsModel,
-		LLMBaseURL:   llmBaseURL,
-		LLMAPIKey:    llmKey,
-		LLMModel:     llmModel,
+		Addr:             ":8080",
+		STTProvider:      sttProvider,
+		STTAPIKey:        sttKey,
+		STTModel:         sttModel,
+		TTSProvider:      ttsProvider,
+		TTSAPIKey:        ttsKey,
+		TTSModel:         ttsModel,
+		LLMBaseURL:       llmBaseURL,
+		LLMAPIKey:        llmKey,
+		LLMModel:         llmModel,
 		VADThreshold:     vadThreshold,
 		VADThresholdBump: vadThresholdBump,
-		LogLevel:     logLevel,
+		SilenceFrames:    silenceFrames,
+		PrerollSize:      prerollSize,
+		DrainDelay:       drainDelay,
+		LogLevel:         logLevel,
 	}, nil
+}
+
+func envFloat32(key string, fallback float32) float32 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 32); err == nil {
+			return float32(f)
+		}
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return fallback
 }

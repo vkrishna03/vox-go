@@ -2,16 +2,12 @@ package conversation
 
 import (
 	"context"
-	"fmt"
-	"regexp"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/vkrishna03/vox-go/internal/audio"
-	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/llm"
+	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/tts"
 	"github.com/vkrishna03/vox-go/internal/tui"
 )
@@ -57,11 +53,11 @@ type Conversation struct {
 	Speaking       bool
 	pendingText    strings.Builder
 
-	// TUI updates
-	UpdateCh chan any
+	UpdateCh   chan any
+	DrainDelay time.Duration
 }
 
-func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player, updateCh chan any) *Conversation {
+func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player, updateCh chan any, drainDelay time.Duration) *Conversation {
 	return &Conversation{
 		state:  Listening,
 		client: client,
@@ -74,6 +70,7 @@ func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player, updat
 		TranscriptCh: make(chan string, 8),
 		thinkDoneCh:  make(chan string, 1),
 		UpdateCh:     updateCh,
+		DrainDelay:   drainDelay,
 	}
 }
 
@@ -90,6 +87,7 @@ func (c *Conversation) setState(s State) {
 	c.send(tui.StateMsg{State: s.String()})
 }
 
+// Run is the main state machine loop.
 func (c *Conversation) Run(ctx context.Context) {
 	var drainTimer *time.Timer
 	var drainCh <-chan time.Time
@@ -111,7 +109,7 @@ func (c *Conversation) Run(ctx context.Context) {
 			switch c.state {
 			case Listening:
 				if !speaking && c.pendingText.Len() > 0 {
-					drainTimer = time.NewTimer(500 * time.Millisecond)
+					drainTimer = time.NewTimer(c.DrainDelay)
 					drainCh = drainTimer.C
 				}
 			case Responding:
@@ -158,128 +156,4 @@ func (c *Conversation) Run(ctx context.Context) {
 			c.send(tui.ResponseDoneMsg{})
 		}
 	}
-}
-
-func (c *Conversation) think(ctx context.Context, userText string) {
-	c.setState(Thinking)
-	c.history = append(c.history, llm.Message{Role: "user", Content: userText})
-
-	responseCtx, cancel := context.WithCancel(ctx)
-	c.cancelResponse = cancel
-
-	tokenCh, errCh := c.client.Stream(responseCtx, c.history)
-
-	go func() {
-		var response strings.Builder
-		var sentenceBuf strings.Builder
-		first := true
-		sentenceCount := 0
-
-		var playbackWg sync.WaitGroup
-		var finalFlushSent atomic.Bool
-
-		var dumper *logging.AudioDumper
-		if logging.Enabled() {
-			var err error
-			dumper, err = logging.NewAudioDumper(fmt.Sprintf("tts_%s.wav", time.Now().Format("20060102_150405")))
-			if err != nil {
-				logging.Logger.Error("audio dumper", "err", err)
-			}
-		}
-
-		if c.synth != nil && c.player != nil {
-			playbackWg.Add(1)
-			go func() {
-				defer playbackWg.Done()
-				for {
-					data, err := c.synth.Receive()
-					if err != nil {
-						if err == tts.ErrFlushed {
-							logging.Logger.Debug("tts flushed", "finalFlushSent", finalFlushSent.Load())
-							if finalFlushSent.Load() {
-								return
-							}
-							continue
-						}
-						logging.Logger.Error("tts receive", "err", err)
-						return
-					}
-					if len(data) > 0 {
-						c.player.Play(data)
-						if dumper != nil {
-							dumper.Write(data)
-						}
-					}
-				}
-			}()
-		}
-
-		for token := range tokenCh {
-			if first {
-				c.setState(Responding)
-				c.Speaking = true
-				first = false
-			}
-			c.send(tui.TokenMsg{Token: token})
-			response.WriteString(token)
-			sentenceBuf.WriteString(token)
-
-			if c.synth != nil && isSentenceEnd(sentenceBuf.String()) {
-				text := stripMarkdown(sentenceBuf.String())
-				if text != "" {
-					sentenceCount++
-					logging.Logger.Debug("tts send", "sentence", sentenceCount, "len", len(text))
-					c.synth.SendText(text)
-				}
-				sentenceBuf.Reset()
-			}
-		}
-
-		logging.Logger.Debug("llm done", "sentences_sent", sentenceCount)
-
-		if c.synth != nil {
-			remaining := stripMarkdown(sentenceBuf.String())
-			if remaining != "" {
-				c.synth.SendText(remaining)
-			}
-			finalFlushSent.Store(true)
-			c.synth.Flush()
-		}
-
-		if c.synth != nil && c.player != nil {
-			playbackWg.Wait()
-			for c.player.Drain() {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-
-		if dumper != nil {
-			dumper.Close()
-		}
-
-		c.Speaking = false
-
-		if err := <-errCh; err != nil && ctx.Err() == nil && err != context.Canceled {
-			c.send(tui.InfoMsg{Text: fmt.Sprintf("[error: %v]", err)})
-		}
-
-		c.thinkDoneCh <- response.String()
-	}()
-}
-
-func isSentenceEnd(s string) bool {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	last := s[len(s)-1]
-	return last == '.' || last == '!' || last == '?' || last == ':' || last == ';' || last == '\n'
-}
-
-var markdownRe = regexp.MustCompile(`[*_#\[\]()~` + "`" + `>|]`)
-
-func stripMarkdown(s string) string {
-	s = markdownRe.ReplaceAllString(s, "")
-	s = strings.ReplaceAll(s, "  ", " ")
-	return strings.TrimSpace(s)
 }

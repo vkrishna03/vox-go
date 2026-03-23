@@ -16,6 +16,8 @@ Mic → [VAD] → [STT] → [State Machine] → [LLM] → [TTS] → Speaker
 6. TTS audio plays through your speakers in real-time
 7. Speak during a response to interrupt it
 
+Headphones recommended to avoid echo triggering false interruptions.
+
 ### TUI
 
 Live terminal interface (bubbletea) showing:
@@ -58,9 +60,7 @@ Required keys:
 - `STT_API_KEY` — [Deepgram](https://console.deepgram.com/signup) (free $200 credit, no card)
 - `LLM_API_KEY` — [Groq](https://console.groq.com) (free tier)
 
-See [.env.example](.env.example) for all options including TTS model, VAD sensitivity, and log level.
-
-Headphones recommended to avoid echo during TTS playback.
+See [.env.example](.env.example) for all options including TTS model, VAD sensitivity, pipeline tuning, and log level.
 
 ## Run
 
@@ -105,13 +105,16 @@ LLM_MODEL=llama3
 ## Project Structure
 
 ```
-cmd/vox/                      CLI entrypoint, goroutine wiring
+cmd/vox/                      CLI entrypoint, component wiring
 internal/
   audio/
     capture.go                Mic input (PortAudio, 16kHz)
     player.go                 Speaker output (PortAudio, 24kHz, ring buffer)
+    convert.go                PCM format conversions (int16 ↔ float32/bytes)
   vad/
     vad.go                    Silero VAD via ONNX Runtime
+  pipeline/
+    pipeline.go               Mic → VAD → STT loop with preroll and echo suppression
   transcribe/
     transcribe.go             Transcriber interface
     deepgram.go               Deepgram STT (WebSocket streaming)
@@ -123,6 +126,8 @@ internal/
     deepgram.go               Deepgram TTS (WebSocket streaming)
   conversation/
     conversation.go           State machine, turn-taking, interruption
+    respond.go                LLM token streaming, TTS sentence buffering, playback
+    text.go                   Sentence detection, markdown stripping
   tui/
     ui.go                     Bubbletea TUI (audio meters, state, conversation)
     messages.go               TUI message types
@@ -130,7 +135,5 @@ internal/
     config.go                 Env-based configuration (godotenv)
   logging/
     logging.go                Structured logging (slog) + audio dumper
-  server/
-    server.go                 HTTP server (for future use)
 docs/                         Architecture, configuration, and guides
 ```
