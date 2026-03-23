@@ -4,17 +4,18 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
 	"sync"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/vkrishna03/vox-go/internal/audio"
 	"github.com/vkrishna03/vox-go/internal/config"
 	"github.com/vkrishna03/vox-go/internal/conversation"
-	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/llm"
+	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/transcribe"
 	"github.com/vkrishna03/vox-go/internal/tts"
+	"github.com/vkrishna03/vox-go/internal/tui"
 	"github.com/vkrishna03/vox-go/internal/vad"
 )
 
@@ -33,8 +34,8 @@ func run() error {
 
 	logging.Init(cfg.LogLevel)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Init ONNX Runtime
 	if err := vad.Init("/opt/homebrew/lib/libonnxruntime.dylib"); err != nil {
@@ -42,28 +43,24 @@ func run() error {
 	}
 	defer vad.Shutdown()
 
-	// Init VAD
 	detector, err := vad.NewDetector("models/silero_vad.onnx", cfg.VADThreshold)
 	if err != nil {
 		return fmt.Errorf("vad: %w", err)
 	}
 	defer detector.Destroy()
 
-	// Init mic
 	rec, err := audio.NewRecorder()
 	if err != nil {
 		return fmt.Errorf("recorder: %w", err)
 	}
 	defer rec.Close()
 
-	// Init speaker output
 	player, err := audio.NewPlayer()
 	if err != nil {
 		return fmt.Errorf("player: %w", err)
 	}
 	defer player.Close()
 
-	// Connect to STT provider
 	stt, err := newTranscriber(cfg)
 	if err != nil {
 		return err
@@ -73,7 +70,6 @@ func run() error {
 	}
 	defer stt.Close()
 
-	// Connect to TTS provider
 	synth, err := newSynthesizer(cfg)
 	if err != nil {
 		return err
@@ -83,12 +79,11 @@ func run() error {
 	}
 	defer synth.Close()
 
-	// Init LLM client and conversation
-	llmClient := llm.NewOpenAIClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
-	conv := conversation.New(llmClient, synth, player)
+	// Shared update channel for TUI
+	updateCh := make(chan any, 64)
 
-	fmt.Println("Listening... (Ctrl+C to stop)")
-	fmt.Println()
+	llmClient := llm.NewOpenAIClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	conv := conversation.New(llmClient, synth, player, updateCh)
 
 	if err := rec.Start(); err != nil {
 		return fmt.Errorf("start recording: %w", err)
@@ -96,14 +91,14 @@ func run() error {
 
 	var wg sync.WaitGroup
 
-	// Goroutine 1: mic → VAD → STT + speechCh signaling
+	// Goroutine 1: mic → VAD → STT + speechCh + audio levels
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 
 		speaking := false
 		silenceFrames := 0
-		const silenceThreshold = 30 // ~960ms
+		const silenceThreshold = 30
 
 		const prerollSize = 10
 		preroll := make([][]int16, 0, prerollSize)
@@ -117,24 +112,30 @@ func run() error {
 
 			samples, err := rec.Read()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "mic read error: %v\n", err)
+				logging.Logger.Error("mic read", "err", err)
 				return
 			}
 
+			// Send audio levels to TUI
 			floats := audio.Int16ToFloat32(samples)
-			isSpeech, _, err := detector.IsSpeech(floats)
+			prob, err := detector.Detect(floats)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "vad error: %v\n", err)
+				logging.Logger.Error("vad", "err", err)
 				return
 			}
 
-			// Echo suppression: ignore VAD while TTS is playing through speaker.
-			// Still read mic frames to keep PortAudio buffer flowing.
+			// During TTS, raise threshold for interruption
+			threshold := cfg.VADThreshold
 			if conv.Speaking {
-				speaking = false
-				silenceFrames = 0
-				preroll = preroll[:0]
-				continue
+				threshold = cfg.VADThresholdBump
+			}
+			isSpeech := prob >= threshold
+
+			// Send audio levels + current threshold to TUI
+			level := tui.RMS(samples)
+			select {
+			case updateCh <- tui.AudioMsg{Level: level, VADProb: prob, Threshold: threshold}:
+			default:
 			}
 
 			if isSpeech {
@@ -151,7 +152,7 @@ func run() error {
 					preroll = preroll[:0]
 				}
 				if err := stt.SendAudio(audio.Int16ToBytes(samples)); err != nil {
-					fmt.Fprintf(os.Stderr, "send error: %v\n", err)
+					logging.Logger.Error("stt send", "err", err)
 					return
 				}
 			} else if speaking {
@@ -191,7 +192,7 @@ func run() error {
 				case <-ctx.Done():
 					return
 				default:
-					fmt.Fprintf(os.Stderr, "receive error: %v\n", err)
+					logging.Logger.Error("stt receive", "err", err)
 					return
 				}
 			}
@@ -229,8 +230,17 @@ func run() error {
 		}
 	}()
 
-	<-ctx.Done()
-	fmt.Println("\nStopping...")
+	// Run TUI (blocks until Ctrl+C)
+	model := tui.NewModel(updateCh, cfg.VADThreshold)
+	p := tea.NewProgram(model, tea.WithAltScreen())
+
+	if _, err := p.Run(); err != nil {
+		cancel()
+		wg.Wait()
+		return fmt.Errorf("tui: %w", err)
+	}
+
+	cancel()
 	wg.Wait()
 	return nil
 }

@@ -3,7 +3,6 @@ package conversation
 import (
 	"context"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,6 +13,7 @@ import (
 	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/llm"
 	"github.com/vkrishna03/vox-go/internal/tts"
+	"github.com/vkrishna03/vox-go/internal/tui"
 )
 
 type State int
@@ -56,9 +56,12 @@ type Conversation struct {
 	cancelResponse context.CancelFunc
 	Speaking       bool
 	pendingText    strings.Builder
+
+	// TUI updates
+	UpdateCh chan any
 }
 
-func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player) *Conversation {
+func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player, updateCh chan any) *Conversation {
 	return &Conversation{
 		state:  Listening,
 		client: client,
@@ -70,12 +73,21 @@ func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player) *Conv
 		SpeechCh:     make(chan bool, 1),
 		TranscriptCh: make(chan string, 8),
 		thinkDoneCh:  make(chan string, 1),
+		UpdateCh:     updateCh,
+	}
+}
+
+func (c *Conversation) send(msg any) {
+	select {
+	case c.UpdateCh <- msg:
+	default:
 	}
 }
 
 func (c *Conversation) setState(s State) {
 	c.state = s
 	logging.Logger.Info("state", "to", s.String())
+	c.send(tui.StateMsg{State: s.String()})
 }
 
 func (c *Conversation) Run(ctx context.Context) {
@@ -112,7 +124,7 @@ func (c *Conversation) Run(ctx context.Context) {
 					}
 					c.Speaking = false
 					logging.Logger.Info("interrupted")
-					fmt.Print("\n[interrupted]\n\n")
+					c.send(tui.InfoMsg{Text: "[interrupted]"})
 				}
 			}
 
@@ -133,7 +145,7 @@ func (c *Conversation) Run(ctx context.Context) {
 			c.pendingText.Reset()
 
 			if userText != "" {
-				fmt.Printf("> %s\n\n", userText)
+				c.send(tui.TranscriptMsg{Text: userText})
 				c.think(ctx, userText)
 			}
 
@@ -143,7 +155,7 @@ func (c *Conversation) Run(ctx context.Context) {
 			}
 			c.setState(Listening)
 			c.Speaking = false
-			fmt.Print("\n\n")
+			c.send(tui.ResponseDoneMsg{})
 		}
 	}
 }
@@ -151,8 +163,6 @@ func (c *Conversation) Run(ctx context.Context) {
 func (c *Conversation) think(ctx context.Context, userText string) {
 	c.setState(Thinking)
 	c.history = append(c.history, llm.Message{Role: "user", Content: userText})
-
-	fmt.Print("[thinking...] ")
 
 	responseCtx, cancel := context.WithCancel(ctx)
 	c.cancelResponse = cancel
@@ -168,7 +178,6 @@ func (c *Conversation) think(ctx context.Context, userText string) {
 		var playbackWg sync.WaitGroup
 		var finalFlushSent atomic.Bool
 
-		// Audio dumper for debugging
 		var dumper *logging.AudioDumper
 		if logging.Enabled() {
 			var err error
@@ -182,25 +191,20 @@ func (c *Conversation) think(ctx context.Context, userText string) {
 			playbackWg.Add(1)
 			go func() {
 				defer playbackWg.Done()
-				totalBytes := 0
-				chunks := 0
 				for {
 					data, err := c.synth.Receive()
 					if err != nil {
 						if err == tts.ErrFlushed {
-							logging.Logger.Debug("tts flushed", "finalFlushSent", finalFlushSent.Load(), "totalBytes", totalBytes, "chunks", chunks)
+							logging.Logger.Debug("tts flushed", "finalFlushSent", finalFlushSent.Load())
 							if finalFlushSent.Load() {
 								return
 							}
 							continue
 						}
 						logging.Logger.Error("tts receive", "err", err)
-						fmt.Fprintf(os.Stderr, "\ntts receive error: %v\n", err)
 						return
 					}
 					if len(data) > 0 {
-						totalBytes += len(data)
-						chunks++
 						c.player.Play(data)
 						if dumper != nil {
 							dumper.Write(data)
@@ -212,12 +216,11 @@ func (c *Conversation) think(ctx context.Context, userText string) {
 
 		for token := range tokenCh {
 			if first {
-				fmt.Print("\r\033[K")
 				c.setState(Responding)
 				c.Speaking = true
 				first = false
 			}
-			fmt.Print(token)
+			c.send(tui.TokenMsg{Token: token})
 			response.WriteString(token)
 			sentenceBuf.WriteString(token)
 
@@ -225,7 +228,7 @@ func (c *Conversation) think(ctx context.Context, userText string) {
 				text := stripMarkdown(sentenceBuf.String())
 				if text != "" {
 					sentenceCount++
-					logging.Logger.Debug("tts send", "sentence", sentenceCount, "len", len(text), "text", text)
+					logging.Logger.Debug("tts send", "sentence", sentenceCount, "len", len(text))
 					c.synth.SendText(text)
 				}
 				sentenceBuf.Reset()
@@ -237,34 +240,27 @@ func (c *Conversation) think(ctx context.Context, userText string) {
 		if c.synth != nil {
 			remaining := stripMarkdown(sentenceBuf.String())
 			if remaining != "" {
-				logging.Logger.Debug("tts send remaining", "len", len(remaining), "text", remaining)
 				c.synth.SendText(remaining)
 			}
-			logging.Logger.Debug("sending final flush")
 			finalFlushSent.Store(true)
 			c.synth.Flush()
 		}
 
 		if c.synth != nil && c.player != nil {
-			logging.Logger.Debug("waiting for playback to finish")
 			playbackWg.Wait()
-			logging.Logger.Debug("playback goroutine done, draining ring buffer")
-
 			for c.player.Drain() {
 				time.Sleep(50 * time.Millisecond)
 			}
-			logging.Logger.Debug("ring buffer drained")
 		}
 
 		if dumper != nil {
 			dumper.Close()
-			logging.Logger.Info("audio dumped to file")
 		}
 
 		c.Speaking = false
 
 		if err := <-errCh; err != nil && ctx.Err() == nil && err != context.Canceled {
-			fmt.Printf("\n[error: %v]\n", err)
+			c.send(tui.InfoMsg{Text: fmt.Sprintf("[error: %v]", err)})
 		}
 
 		c.thinkDoneCh <- response.String()

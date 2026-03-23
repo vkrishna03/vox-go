@@ -19,8 +19,9 @@ type Config struct {
 	LLMBaseURL   string
 	LLMAPIKey    string
 	LLMModel     string
-	VADThreshold float32
-	LogLevel     string
+	VADThreshold      float32
+	VADThresholdBump  float32
+	LogLevel          string
 }
 
 func Load() (*Config, error) {
@@ -80,6 +81,13 @@ func Load() (*Config, error) {
 		}
 	}
 
+	var vadThresholdBump float32 = 0.7
+	if v := os.Getenv("VAD_THRESHOLD_BUMP"); v != "" {
+		if f, err := strconv.ParseFloat(v, 32); err == nil {
+			vadThresholdBump = float32(f)
+		}
+	}
+
 	logLevel := os.Getenv("LOG_LEVEL") // empty = disabled, "debug", "info", "warn", "error"
 
 	return &Config{
@@ -93,7 +101,8 @@ func Load() (*Config, error) {
 		LLMBaseURL:   llmBaseURL,
 		LLMAPIKey:    llmKey,
 		LLMModel:     llmModel,
-		VADThreshold: vadThreshold,
+		VADThreshold:     vadThreshold,
+		VADThresholdBump: vadThresholdBump,
 		LogLevel:     logLevel,
 	}, nil
 }
