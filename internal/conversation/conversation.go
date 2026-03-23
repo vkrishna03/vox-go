@@ -3,10 +3,17 @@ package conversation
 import (
 	"context"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/vkrishna03/vox-go/internal/audio"
+	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/llm"
+	"github.com/vkrishna03/vox-go/internal/tts"
 )
 
 type State int
@@ -30,29 +37,35 @@ func (s State) String() string {
 	}
 }
 
+var systemPrompt = `You are a helpful voice assistant. Keep responses concise and conversational.
+IMPORTANT: Your responses will be spoken aloud via text-to-speech.
+Do NOT use markdown formatting (no **, no ##, no bullet points, no numbered lists).
+Use plain, natural spoken language only.`
+
 type Conversation struct {
 	state   State
 	history []llm.Message
 	client  llm.Streamer
+	synth   tts.Synthesizer
+	player  *audio.Player
 
-	// Channels — the nervous system
-	SpeechCh     chan bool   // true=speech started, false=speech ended
-	TranscriptCh chan string // final transcripts from Deepgram
-	thinkDoneCh  chan string // assistant response (full or partial) from think goroutine
+	SpeechCh     chan bool
+	TranscriptCh chan string
+	thinkDoneCh  chan string
 
-	// Cancellation for the current LLM response
 	cancelResponse context.CancelFunc
-
-	// Accumulated text while listening
-	pendingText strings.Builder
+	Speaking       bool
+	pendingText    strings.Builder
 }
 
-func New(client llm.Streamer) *Conversation {
+func New(client llm.Streamer, synth tts.Synthesizer, player *audio.Player) *Conversation {
 	return &Conversation{
 		state:  Listening,
 		client: client,
+		synth:  synth,
+		player: player,
 		history: []llm.Message{
-			{Role: "system", Content: "You are a helpful voice assistant. Keep responses concise and conversational."},
+			{Role: "system", Content: systemPrompt},
 		},
 		SpeechCh:     make(chan bool, 1),
 		TranscriptCh: make(chan string, 8),
@@ -60,9 +73,12 @@ func New(client llm.Streamer) *Conversation {
 	}
 }
 
-// Run is the main state machine loop. It reads from channels and manages transitions.
+func (c *Conversation) setState(s State) {
+	c.state = s
+	logging.Logger.Info("state", "to", s.String())
+}
+
 func (c *Conversation) Run(ctx context.Context) {
-	// Timer for collecting late transcripts after speech ends
 	var drainTimer *time.Timer
 	var drainCh <-chan time.Time
 
@@ -75,29 +91,32 @@ func (c *Conversation) Run(ctx context.Context) {
 			if c.state == Listening {
 				c.pendingText.WriteString(text)
 				c.pendingText.WriteString(" ")
+				logging.Logger.Debug("transcript", "text", text)
 			}
 
 		case speaking := <-c.SpeechCh:
+			logging.Logger.Debug("speech", "speaking", speaking, "state", c.state.String())
 			switch c.state {
 			case Listening:
 				if !speaking && c.pendingText.Len() > 0 {
-					// Speech ended with accumulated text.
-					// Wait briefly for any late Deepgram finals.
 					drainTimer = time.NewTimer(500 * time.Millisecond)
 					drainCh = drainTimer.C
 				}
 			case Responding:
 				if speaking {
-					// Interruption! Cancel the LLM stream.
 					if c.cancelResponse != nil {
 						c.cancelResponse()
 					}
+					if c.player != nil {
+						c.player.Clear()
+					}
+					c.Speaking = false
+					logging.Logger.Info("interrupted")
 					fmt.Print("\n[interrupted]\n\n")
 				}
 			}
 
 		case <-drainCh:
-			// Drain timer fired — collect any remaining transcripts and transition
 			drainCh = nil
 		drainLoop:
 			for {
@@ -119,50 +138,152 @@ func (c *Conversation) Run(ctx context.Context) {
 			}
 
 		case response := <-c.thinkDoneCh:
-			// think goroutine finished (completed or interrupted)
 			if response != "" {
 				c.history = append(c.history, llm.Message{Role: "assistant", Content: response})
 			}
-			c.state = Listening
+			c.setState(Listening)
+			c.Speaking = false
 			fmt.Print("\n\n")
 		}
 	}
 }
 
-// think transitions to THINKING state and spawns the LLM goroutine.
 func (c *Conversation) think(ctx context.Context, userText string) {
-	c.state = Thinking
+	c.setState(Thinking)
 	c.history = append(c.history, llm.Message{Role: "user", Content: userText})
 
 	fmt.Print("[thinking...] ")
 
-	// Create a cancellable child context for this response
 	responseCtx, cancel := context.WithCancel(ctx)
 	c.cancelResponse = cancel
 
 	tokenCh, errCh := c.client.Stream(responseCtx, c.history)
 
-	// Spawn goroutine to read tokens and print them
 	go func() {
 		var response strings.Builder
+		var sentenceBuf strings.Builder
 		first := true
+		sentenceCount := 0
+
+		var playbackWg sync.WaitGroup
+		var finalFlushSent atomic.Bool
+
+		// Audio dumper for debugging
+		var dumper *logging.AudioDumper
+		if logging.Enabled() {
+			var err error
+			dumper, err = logging.NewAudioDumper(fmt.Sprintf("tts_%s.wav", time.Now().Format("20060102_150405")))
+			if err != nil {
+				logging.Logger.Error("audio dumper", "err", err)
+			}
+		}
+
+		if c.synth != nil && c.player != nil {
+			playbackWg.Add(1)
+			go func() {
+				defer playbackWg.Done()
+				totalBytes := 0
+				chunks := 0
+				for {
+					data, err := c.synth.Receive()
+					if err != nil {
+						if err == tts.ErrFlushed {
+							logging.Logger.Debug("tts flushed", "finalFlushSent", finalFlushSent.Load(), "totalBytes", totalBytes, "chunks", chunks)
+							if finalFlushSent.Load() {
+								return
+							}
+							continue
+						}
+						logging.Logger.Error("tts receive", "err", err)
+						fmt.Fprintf(os.Stderr, "\ntts receive error: %v\n", err)
+						return
+					}
+					if len(data) > 0 {
+						totalBytes += len(data)
+						chunks++
+						c.player.Play(data)
+						if dumper != nil {
+							dumper.Write(data)
+						}
+					}
+				}
+			}()
+		}
 
 		for token := range tokenCh {
 			if first {
-				// Clear the [thinking...] indicator
 				fmt.Print("\r\033[K")
-				c.state = Responding
+				c.setState(Responding)
+				c.Speaking = true
 				first = false
 			}
 			fmt.Print(token)
 			response.WriteString(token)
+			sentenceBuf.WriteString(token)
+
+			if c.synth != nil && isSentenceEnd(sentenceBuf.String()) {
+				text := stripMarkdown(sentenceBuf.String())
+				if text != "" {
+					sentenceCount++
+					logging.Logger.Debug("tts send", "sentence", sentenceCount, "len", len(text), "text", text)
+					c.synth.SendText(text)
+				}
+				sentenceBuf.Reset()
+			}
 		}
 
-		// Check for errors (ignore context cancelled — that's interruption)
+		logging.Logger.Debug("llm done", "sentences_sent", sentenceCount)
+
+		if c.synth != nil {
+			remaining := stripMarkdown(sentenceBuf.String())
+			if remaining != "" {
+				logging.Logger.Debug("tts send remaining", "len", len(remaining), "text", remaining)
+				c.synth.SendText(remaining)
+			}
+			logging.Logger.Debug("sending final flush")
+			finalFlushSent.Store(true)
+			c.synth.Flush()
+		}
+
+		if c.synth != nil && c.player != nil {
+			logging.Logger.Debug("waiting for playback to finish")
+			playbackWg.Wait()
+			logging.Logger.Debug("playback goroutine done, draining ring buffer")
+
+			for c.player.Drain() {
+				time.Sleep(50 * time.Millisecond)
+			}
+			logging.Logger.Debug("ring buffer drained")
+		}
+
+		if dumper != nil {
+			dumper.Close()
+			logging.Logger.Info("audio dumped to file")
+		}
+
+		c.Speaking = false
+
 		if err := <-errCh; err != nil && ctx.Err() == nil && err != context.Canceled {
 			fmt.Printf("\n[error: %v]\n", err)
 		}
 
 		c.thinkDoneCh <- response.String()
 	}()
+}
+
+func isSentenceEnd(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	last := s[len(s)-1]
+	return last == '.' || last == '!' || last == '?' || last == ':' || last == ';' || last == '\n'
+}
+
+var markdownRe = regexp.MustCompile(`[*_#\[\]()~` + "`" + `>|]`)
+
+func stripMarkdown(s string) string {
+	s = markdownRe.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "  ", " ")
+	return strings.TrimSpace(s)
 }

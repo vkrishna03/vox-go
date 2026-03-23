@@ -15,6 +15,7 @@ const deepgramURL = "wss://api.deepgram.com/v1/listen"
 type Deepgram struct {
 	conn   *websocket.Conn
 	apiKey string
+	model  string
 }
 
 // deepgramResult is the raw JSON response from Deepgram.
@@ -29,12 +30,12 @@ type deepgramResult struct {
 	} `json:"channel"`
 }
 
-func NewDeepgram(apiKey string) *Deepgram {
-	return &Deepgram{apiKey: apiKey}
+func NewDeepgram(apiKey, model string) *Deepgram {
+	return &Deepgram{apiKey: apiKey, model: model}
 }
 
 func (d *Deepgram) Connect(ctx context.Context) error {
-	url := deepgramURL + "?model=nova-3&encoding=linear16&sample_rate=16000&interim_results=true&punctuate=true"
+	url := fmt.Sprintf("%s?model=%s&encoding=linear16&sample_rate=16000&interim_results=true&punctuate=true", deepgramURL, d.model)
 
 	header := http.Header{}
 	header.Set("Authorization", "Token "+d.apiKey)

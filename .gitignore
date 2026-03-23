@@ -27,3 +27,6 @@ Thumbs.db
 
 # Models
 models/*.onnx
+
+# Logs
+logs/

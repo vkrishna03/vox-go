@@ -11,8 +11,10 @@ import (
 	"github.com/vkrishna03/vox-go/internal/audio"
 	"github.com/vkrishna03/vox-go/internal/config"
 	"github.com/vkrishna03/vox-go/internal/conversation"
+	"github.com/vkrishna03/vox-go/internal/logging"
 	"github.com/vkrishna03/vox-go/internal/llm"
 	"github.com/vkrishna03/vox-go/internal/transcribe"
+	"github.com/vkrishna03/vox-go/internal/tts"
 	"github.com/vkrishna03/vox-go/internal/vad"
 )
 
@@ -28,6 +30,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	logging.Init(cfg.LogLevel)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -52,6 +56,13 @@ func run() error {
 	}
 	defer rec.Close()
 
+	// Init speaker output
+	player, err := audio.NewPlayer()
+	if err != nil {
+		return fmt.Errorf("player: %w", err)
+	}
+	defer player.Close()
+
 	// Connect to STT provider
 	stt, err := newTranscriber(cfg)
 	if err != nil {
@@ -62,9 +73,19 @@ func run() error {
 	}
 	defer stt.Close()
 
+	// Connect to TTS provider
+	synth, err := newSynthesizer(cfg)
+	if err != nil {
+		return err
+	}
+	if err := synth.Connect(ctx); err != nil {
+		return err
+	}
+	defer synth.Close()
+
 	// Init LLM client and conversation
 	llmClient := llm.NewOpenAIClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
-	conv := conversation.New(llmClient)
+	conv := conversation.New(llmClient, synth, player)
 
 	fmt.Println("Listening... (Ctrl+C to stop)")
 	fmt.Println()
@@ -84,8 +105,6 @@ func run() error {
 		silenceFrames := 0
 		const silenceThreshold = 30 // ~960ms
 
-		// Pre-roll buffer: keep last 10 frames (~320ms) so we don't clip
-		// the start of words when VAD triggers.
 		const prerollSize = 10
 		preroll := make([][]int16, 0, prerollSize)
 
@@ -109,16 +128,23 @@ func run() error {
 				return
 			}
 
+			// Echo suppression: ignore VAD while TTS is playing through speaker.
+			// Still read mic frames to keep PortAudio buffer flowing.
+			if conv.Speaking {
+				speaking = false
+				silenceFrames = 0
+				preroll = preroll[:0]
+				continue
+			}
+
 			if isSpeech {
 				silenceFrames = 0
 				if !speaking {
 					speaking = true
-					// Signal: speech started
 					select {
 					case conv.SpeechCh <- true:
 					default:
 					}
-					// Flush pre-roll buffer so Deepgram gets the start of the word
 					for _, old := range preroll {
 						stt.SendAudio(audio.Int16ToBytes(old))
 					}
@@ -134,14 +160,12 @@ func run() error {
 
 				if silenceFrames >= silenceThreshold {
 					speaking = false
-					// Signal: speech ended
 					select {
 					case conv.SpeechCh <- false:
 					default:
 					}
 				}
 			} else {
-				// Not speaking — fill pre-roll buffer (ring buffer)
 				if len(preroll) >= prerollSize {
 					preroll = preroll[1:]
 				}
@@ -189,7 +213,7 @@ func run() error {
 		conv.Run(ctx)
 	}()
 
-	// Goroutine 4: deepgram keep-alive
+	// Goroutine 4: STT keep-alive
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -214,8 +238,17 @@ func run() error {
 func newTranscriber(cfg *config.Config) (transcribe.Transcriber, error) {
 	switch cfg.STTProvider {
 	case "deepgram":
-		return transcribe.NewDeepgram(cfg.STTAPIKey), nil
+		return transcribe.NewDeepgram(cfg.STTAPIKey, cfg.STTModel), nil
 	default:
 		return nil, fmt.Errorf("unknown STT provider: %s", cfg.STTProvider)
+	}
+}
+
+func newSynthesizer(cfg *config.Config) (tts.Synthesizer, error) {
+	switch cfg.TTSProvider {
+	case "deepgram":
+		return tts.NewDeepgramTTS(cfg.TTSAPIKey, cfg.TTSModel), nil
+	default:
+		return nil, fmt.Errorf("unknown TTS provider: %s", cfg.TTSProvider)
 	}
 }
